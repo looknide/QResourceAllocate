@@ -1,15 +1,16 @@
 package quantum.algorithm
 
-import quantum.topo.Edge
-import quantum.topo.Node
-import quantum.topo.Path
-import quantum.topo.Topo
+import quantum.rl.RLAgent
+import quantum.rl.StateBuilder
+import quantum.topo.*
 import utils.require
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
 import java.io.Writer
+import java.util.*
 import kotlin.math.ceil
+import kotlin.to
 
 abstract class AlgorithmNotCleanSD(val topo: Topo) {
   abstract val name: String
@@ -31,6 +32,9 @@ abstract class AlgorithmNotCleanSD(val topo: Topo) {
 
   val MaxListLength=15
 
+  val majorPaths = mutableListOf<PickedPathNotClearSD>()
+  val recoveryPaths = HashMap<PickedPathNotClearSD, LinkedList<PickedPathNotClearSD>>()
+
 
   // 任黎
   // Pair联合两个对象。
@@ -43,6 +47,7 @@ abstract class AlgorithmNotCleanSD(val topo: Topo) {
   var SlesrcDstPairs:List<Triple<Node,Node,Int>> = mutableListOf()
   //var SlesrcDstPairs:List<Pair<Node,Node>> = mutableListOf()
 
+
   fun work(pairs: List<Quadruple<Node,Node,Int,Int,Int,Int,Int>>): Pair<Int, Int> {
     require({ topo.isClean() })
 
@@ -51,7 +56,7 @@ abstract class AlgorithmNotCleanSD(val topo: Topo) {
 
     // 判断当前优先级队列长度
     // 若大于等于最大长度，直接不加入本次的请求，将本次请求直接列入失败
-    // 若小于，但不能全部加入，则选择性加入，按照优先级
+    // 若小于，但不能全部加入，则选择性加入，按照优先级Qc->Qp
     if (srcDstPairs.size>=MaxListLength){
       // 太拥挤，筛选请求，进行避免.
       println("队列已满")
@@ -76,7 +81,6 @@ abstract class AlgorithmNotCleanSD(val topo: Topo) {
     }
     countSumPair=countSumPair+pairs.size
 
-
     //写入文件
     val pair=SlesrcDstPairs.map { "${it.first.id}⟷${it.second.id}" }
     logWriter.appendln(pair.joinToString())
@@ -94,24 +98,19 @@ abstract class AlgorithmNotCleanSD(val topo: Topo) {
     //取出队列前五个请求的S-D对信息：源节点、终节点
     SlesrcDstPairs= topsrcDstPairs.map { quadruple ->
       Triple(quadruple.src, quadruple.dst,quadruple.demand)
-      //Pair(quadruple.src, quadruple.dst)
     }
 
     //将前五个请求的SD对信息打印出来
     SlesrcDstPairs.forEach{pair: Triple<Node, Node,Int> ->
       println(pair)
     }
-/*    SlesrcDstPairs.forEach{pair: Pair<Node, Node> ->
-      println(pair)
-    }*/
-
-
+    //对Qp中的所有请求找到路径，并pickAndAssignPath_rl
     P2()
-    
+
     tryEntanglement()
-    
+
     P4()
-    
+//    元素为Triple(srcNode, dstNode, 已建立的纠缠路径list)的List
     val established = SlesrcDstPairs.map { (n1, n2) -> n1 to n2 to topo.getEstablishedEntanglements(n1, n2) }
 
     // 打印纠缠路径
@@ -123,7 +122,7 @@ abstract class AlgorithmNotCleanSD(val topo: Topo) {
 
     println("""[$settings] Established: ${established.map { "${it.first.first.id}⟷${it.first.second.id} × ${it.second.size}" }} - $name""".trimIndent())
 
-    //打印看看是否满足
+    //一轮时隙后的全局请求，即Qc中的请求srcDstPairs
     If_TimeOut_or_Finished(srcDstPairs).forEach { quadruple ->
       println(quadruple)
     }
@@ -137,13 +136,9 @@ abstract class AlgorithmNotCleanSD(val topo: Topo) {
 
     // 记录SumPairs
     sumPairs.add(countSumPair)
-
     //记录successPairs
     successtates.add(successRate)
-
-
     //满意度评估
-
     // 成功
     var SuccsatisfactionList: MutableList<Double> = mutableListOf()
     SuccsatisfactionList=cal_Satis_succ(SuccPairs)
@@ -160,25 +155,71 @@ abstract class AlgorithmNotCleanSD(val topo: Topo) {
       println("用户满意度：$satisfication")
     }*/
 
-    // 整体满意度
-
-    // 平均满意度
-    //val weightSatis=(SuccsatisfactionList.sum()+FailsatisfactionList.sum())/countSumPair
-
     // 非平均，直接用一个值
     val weightSatis=SuccsatisfactionList.sum()+FailsatisfactionList.sum()
     val weightSatisFormatted = String.format("%.2f", weightSatis).toDouble()
     println("网络满意度：$weightSatisFormatted")
-
     //记录满意度
     satisfications.add(weightSatisFormatted)
-
-
     //写入文件
     //writeInFile(sumPairs,satisfications,successtates)
 
     topo.clearEntanglements()
     return established.count { it.second.isNotEmpty() } to established.sumBy { it.second.size }
+  }
+
+
+
+
+
+  fun adjustWidth(pick: PickedPathNotClearSD, newW: Int) {
+
+    if (newW <= 0) return
+
+    val path = pick.third
+    val edges = path.edges()
+
+    // 1. 清除之前所有 assigned 链路
+    edges.forEach { (n1, n2) ->
+      n1.links
+        .filter { it.contains(n2) && it.assigned }
+        .forEach { link ->
+          link.assigned = false
+          link.entangled = false
+          link.utilized = false
+//            link.swapper = null
+        }
+    }
+
+    // 2. 按 newW 重新分配链路
+    for ((n1, n2) in edges) {
+      val available = n1.links
+        .filter { !it.assigned && it.contains(n2) }
+        .sortedBy { it.id }
+
+      val toAssign = available.take(newW)
+      toAssign.forEach { link ->
+        link.assignQubits()
+        link.tryEntanglement()
+      }
+    }
+
+    // 3. 创建新的 pick（因为 Triple 的字段是 val）
+    val newPick = PickedPathNotClearSD(
+      pick.first,     // EXT 不变
+      newW,           // 宽度替换为 RL 选的 newW
+      pick.third      // 路径不变
+    )
+
+    // 4. 替换 majorPaths 里的原 pick
+    val idx = majorPaths.indexOf(pick)
+    if (idx >= 0) {
+      majorPaths[idx] = newPick
+    }
+
+    // 5. 替换 recoveryPaths 的 key
+    val rec = recoveryPaths.remove(pick) ?: LinkedList()
+    recoveryPaths[newPick] = rec
   }
 
 
@@ -267,91 +308,6 @@ abstract class AlgorithmNotCleanSD(val topo: Topo) {
     ).take(n)
       .map { it.first }
   }
-
-/*  fun getTopPriorities(srcDstPairs: MutableList<Quadruple<Node, Node, Int, Int, Int, Int, Int>>, switch: Int): List<Quadruple<Node, Node, Int, Int, Int, Int, Int>> {
-    var n = 0
-    if (switch == -1) {
-      n = when {
-        srcDstPairs.size <= 10 -> 8
-        else -> 10
-      }
-    } else {
-      n = srcDstPairs.size
-    }
-
-    val topNPairs = srcDstPairs.map { quadruple ->
-      val demand = quadruple.demand
-      val acceptTime = quadruple.accepttime
-      val priority = quadruple.priority
-      val priorityValue = calculatePriority(priority, demand, acceptTime)
-      println("Priority of ${quadruple.src} ⟷ ${quadruple.dst}: $priorityValue")
-      quadruple to priorityValue // 将 SD 对与其优先级值一起返回
-    }.sortedWith(compareBy<Pair<Quadruple<Node, Node, Int, Int, Int, Int, Int>, Int>> { it.second } // 根据优先级值进行升序排序
-      .thenBy { it.first.accepttime } // 相同优先级时按照 acceptTime 进行升序排序
-    ).take(n)
-
-    // 过滤具有相同源节点或目的节点的源目对
-    val distinctPairs = mutableListOf<Quadruple<Node, Node, Int, Int, Int, Int, Int>>()
-    val visitedSources = mutableSetOf<Node>()
-    val visitedDestinations = mutableSetOf<Node>()
-    topNPairs.forEach { pair ->
-      val (src, dst) = pair.first.src to pair.first.dst
-      if (src !in visitedSources && dst !in visitedDestinations && src !in visitedDestinations && dst !in visitedSources) {
-        distinctPairs.add(pair.first)
-        visitedSources.add(src)
-        visitedDestinations.add(dst)
-      }
-    }
-    return distinctPairs
-  }*/
-
-  // 筛选请求，过滤具有相同源节点或目的节点的源目对
-/*  fun getTopPriorities(srcDstPairs: MutableList<Quadruple<Node, Node, Int, Int, Int, Int, Int>>, switch: Int): List<Quadruple<Node, Node, Int, Int, Int, Int, Int>> {
-    var n = 0
-    if (switch == -1) {
-      n = when {
-        srcDstPairs.size <= 10 -> 8
-        else -> 10
-      }
-    } else {
-      n = srcDstPairs.size
-    }
-
-    // 先过滤具有相同源节点或目的节点的源目对
-    val filteredPairs = mutableListOf<Quadruple<Node, Node, Int, Int, Int, Int, Int>>()
-    val visitedSources = mutableSetOf<Node>()
-    val visitedDestinations = mutableSetOf<Node>()
-    srcDstPairs.forEach { pair ->
-      val (src, dst) = pair.src to pair.dst
-      if (src !in visitedSources && dst !in visitedDestinations && src !in visitedDestinations && dst !in visitedSources) {
-        filteredPairs.add(pair)
-        visitedSources.add(src)
-        visitedDestinations.add(dst)
-      }
-    }
-
-    // 计算每个请求的优先级
-    val pairsWithPriority = filteredPairs.map { quadruple ->
-      val demand = quadruple.demand
-      val acceptTime = quadruple.accepttime
-      val priority = quadruple.priority
-      val priorityValue = calculatePriority(priority, demand, acceptTime)
-      println("Priority of ${quadruple.src} ⟷ ${quadruple.dst}: $priorityValue")
-      quadruple to priorityValue // 将 SD 对与其优先级值一起返回
-    }
-
-    // 根据优先级值进行排序
-    val sortedPairs = pairsWithPriority.sortedWith(compareBy<Pair<Quadruple<Node, Node, Int, Int, Int, Int, Int>, Int>> { it.second }
-      .thenBy { it.first.accepttime }
-    )
-
-    // 取前n个优先级高的请求
-    val topNPairs = sortedPairs.take(n)
-
-    return topNPairs.map { it.first }
-  }*/
-
-
 
   // 计算用户满意度
   // 初步设想根据需求量和等待时间来进行判断:

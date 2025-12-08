@@ -17,7 +17,7 @@ val dList = listOf(6, 5, 4, 3)
 val kList = listOf(3, 6, 0, 10000)
 val qList = listOf(0.9, 0.8, 0.85, 0.95, 1.0)
 val pList = listOf(0.6, 0.3, 0.9, 0.1)
-val nsdList = (1..10).toList()
+val nsdList = (1..10).toList() //限制了请求的数量
 val topoRange = (1..1).toList()
 
 val allAvailableSettings =

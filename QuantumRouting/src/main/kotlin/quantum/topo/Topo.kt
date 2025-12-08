@@ -160,9 +160,9 @@ ${links.groupBy { it.n1 to it.n2 }.map { "${it.key.n1.id} ${it.key.n2.id} ${it.v
       it.s1 = false
       it.s2 = false
     }
-    
+
     nodes.forEach { it.internalLinks.clear() }
-    
+
     require({ nodes.all { it.nQubits == it.remainingQubits } })
   }
   
@@ -177,7 +177,34 @@ ${links.groupBy { it.n1 to it.n2 }.map { "${it.key.n1.id} ${it.key.n2.id} ${it.v
   
   fun isClean() = links.all { !it.entangled && !it.assigned && it.notSwapped() }
     && nodes.all { it.internalLinks.isEmpty() } && nodes.all { it.nQubits == it.remainingQubits }
-  
+  fun fullReset() {
+
+    // 1. 清理所有链路的占用/纠缠/交换状态
+    links.forEach { link ->
+      link.assigned = false
+      link.entangled = false
+      link.utilized = false
+
+      link.s1 = false
+      link.s2 = false
+
+      link.clearEntanglement()  // 包含 swapped 标记清理
+    }
+
+    // 2. 清空所有节点的交换结构，并恢复 qubit
+    nodes.forEach { node ->
+      node.internalLinks.clear()
+      node.remainingQubits = node.nQubits
+    }
+
+    // 3. 最终一致性检查
+    require(isClean()) {
+      "fullReset 后 topo 仍然不干净——某些资源状态未被清除"
+    }
+  }
+
+
+
   fun kHopNeighbors(root: Node, k: Int = this.k): HashSet<Node> {
     if (k > this.k) return nodes.toHashSet() // as long as the graph is connected
     val registered = nodes.map { false }.toTypedArray()
@@ -232,42 +259,116 @@ ${links.groupBy { it.n1 to it.n2 }.map { "${it.key.n1.id} ${it.key.n2.id} ${it.v
     work()
     return result
   }
-  
-  fun getEstablishedEntanglements(n1: Node, n2: Node): MutableList<Path> {
-    val stack = Stack<Pair<Link?, Node>>()
-    stack.push(null to n1)
-    
-    val result = mutableListOf<Path>()
-    
-    while (stack.isNotEmpty()) {
-      val (incoming, current) = stack.pop()
-      
-      if (current == n2) {
-        val path = mutableListOf<Node>(n2)
-        var inc = incoming!!
-        while (inc.n1 != n1 && inc.n2 != n1) {
-          val prev = if (inc.n1 == path.last()) inc.n2 else inc.n1
-          inc = prev.internalLinks.first { it.contains(inc) }.otherThan(inc)
-          path.add(prev)
-        }
-        path.add(n1)
-        result.add(path.reversed())
+//  返回n1，n2之间的纠缠路径Path = List<Node>列表
+fun getEstablishedEntanglements(n1: Node, n2: Node): MutableList<Path> {
+  val stack = Stack<Pair<Link?, Node>>()
+  stack.push(null to n1)
+  val result = mutableListOf<Path>()
+
+  while (stack.isNotEmpty()) {
+    val (incoming, current) = stack.pop()
+
+    // 到达目标 n2，尝试回溯路径
+    if (current == n2) {
+      // 如果 incoming 是 null，说明我们是从起点直接到了终点（或者结构坏了）
+      if (incoming == null) {
+        // 这种情况没法回溯，直接跳过这条
+        println(">>> [getEstablished] 到达 $n2 但是 incoming==null，跳过该路径")
         continue
       }
-      
-      val outgoingLinks = if (incoming == null) {
-        current.links.filter { it.entangled && !it.swappedAt(current) }
+
+      val path = mutableListOf<Node>(n2)
+      var inc: Link? = incoming
+
+      // 从 n2 往回走，直到走回 n1，或者发现链路结构断了
+      while (inc != null && inc.n1 != n1 && inc.n2 != n1) {
+        val lastNode = path.last()
+        val prev = if (inc.n1 == lastNode) inc.n2 else inc.n1
+
+        // 在 prev.internalLinks 里找包含 inc 的那一对 (l1, l2)
+        val pair = prev.internalLinks.firstOrNull { (l1, l2) ->
+          l1 == inc || l2 == inc
+        }
+
+        if (pair == null) {
+          // 结构断了，回溯不下去，放弃这一条
+          println(">>> [getEstablished] 回溯失败：在节点 ${prev.id} 找不到包含链路${inc.id} 的 internalLinks，对应路径被丢弃")
+          inc = null
+          break
+        }
+
+        // 换到 internalLinks 中的另一条链路
+        inc = if (pair.first == inc) pair.second else pair.first
+        path.add(prev)
+      }
+
+      if (inc != null) {
+        // 成功回溯到 n1
+        path.add(n1)
+        result.add(path.reversed())
       } else {
-        current.internalLinks.filter { it.contains(incoming) }.map { it.otherThan(incoming) }
+        // 回溯失败，整条 path 作废
+        println(">>> [getEstablished] 回溯未能到达起点 N#${n1.id}，丢弃该候选路径")
       }
-      
-      for (l in outgoingLinks) {
-        stack.push(l to Pair(l.n1, l.n2).otherThan(current))
-      }
+
+      continue
     }
-    
-    return result
+
+    // 没到终点，继续向外扩展
+    val outgoingLinks: List<Link> = if (incoming == null) {
+      // 初始从 n1 出发：沿 entangled 且未被 swap 的物理链路走
+      current.links.filter { it.entangled && !it.swappedAt(current) }
+    } else {
+      // 从 internalLinks 里顺着 swapping 链接继续走
+      current.internalLinks
+        .filter { (l1, l2) -> l1 == incoming || l2 == incoming }
+        .map { (l1, l2) -> if (l1 == incoming) l2 else l1 }
+    }
+
+    for (l in outgoingLinks) {
+      val nextNode = if (l.n1 == current) l.n2 else l.n1
+      stack.push(l to nextNode)
+    }
   }
+
+  return result
+}
+
+
+//  fun getEstablishedEntanglements(n1: Node, n2: Node): MutableList<Path> {
+//    val stack = Stack<Pair<Link?, Node>>()
+//    stack.push(null to n1)
+//    val result = mutableListOf<Path>()
+//
+//    while (stack.isNotEmpty()) {
+//      val (incoming, current) = stack.pop()
+//      //触达目标 n2 时的路径回溯
+//      if (current == n2) {
+//        val path = mutableListOf<Node>(n2)
+//        var inc = incoming!!
+//        while (inc.n1 != n1 && inc.n2 != n1) {
+//          val prev = if (inc.n1 == path.last()) inc.n2 else inc.n1
+//          inc = prev.internalLinks.first { it.contains(inc) }.otherThan(inc)
+//          path.add(prev)
+//        }
+//        path.add(n1)
+//        result.add(path.reversed())
+//        continue
+//      }
+//      //沿着 entangled 链路 + swapped 内部链路搜索完整的路径走
+//      val outgoingLinks = if (incoming == null) {
+//        current.links.filter { it.entangled && !it.swappedAt(current) }
+//      } else {
+//        current.internalLinks.filter { it.contains(incoming) }.map { it.otherThan(incoming) }
+//      }
+//
+//      for (l in outgoingLinks) {
+//        stack.push(l to Pair(l.n1, l.n2).otherThan(current))
+//      }
+//    }
+//
+//    return result
+//  }
   
   fun widthPhase2(path: Path) = listOf(path[0].remainingQubits, path.last().remainingQubits,
     path.dropLast(1).drop(1).map { it.remainingQubits }.min()?.div(2) ?: Int.MAX_VALUE,
