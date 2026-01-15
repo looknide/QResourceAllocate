@@ -1,6 +1,5 @@
 package quantum.algorithm
 
-import quantum.rl.FairPathSelector
 import quantum.topo.*
 import utils.ReducibleLazyEvaluation
 import utils.also
@@ -38,11 +37,6 @@ import kotlin.math.ceil
       }
 
       while (true) {
-  //      返回List<PickedPathNotClearSD>即 各请求找到一个(EXT, w, path)
-  //      candidates = [
-  //    (EXT1, w1, path1),   # 对应 R1
-  //    (EXT2, w2, path2),   # 对应 R2
-  //]
         var candidates = calCandidates(SlesrcDstPairs)
         // 对所有路径按照期望吞吐量由大到小排序
         val sortedCandidates = candidates.sortedByDescending { it.first }
@@ -174,21 +168,29 @@ import kotlin.math.ceil
         (1..topo.k).forEach { l ->
           (0..p.size - l - 1).forEach { i ->
             val (src, dst) = p[i] to p[i + l]
-            //此处不需要传输demand进行比较了？？？我感觉还是需要
             val candidates = calCandidates_recovery(listOf(Pair(src, dst)))
-            val pick = candidates.maxBy { it.first }
+            if (candidates.isEmpty()) {
+              println(">>> 恢复路径 ($src -> $dst) 无可用候选，跳过")
+              return@forEach
+            }
+            val pick = candidates.maxBy { it.first }!!
             if (pick != null && pick.first > 0.0) {
               pickAndAssignPath(pick, majorPath)
-//              println(">>> 恢复pick成功 path=${pick.third.map{it.id}}, w=${pick.second}")
+              println(">>> 恢复pick成功 path=${pick.third.map{it.id}}, w=${pick.second}")
             }
           }
         }
-        recoveryPaths[majorPath]!!.forEach { rp ->
-//          println("    rp=${rp.third.map{it.id}}, w=${rp.second}")
+        /*recoveryPaths[majorPath]!!.forEach { rp ->
           p.edges().forEach { (u,v) ->
             val ent = u.links.count { it.contains(v) && it.entangled }
             val ass = u.links.count { it.contains(v) && it.assigned }
-//            println("      edge $u-$v : assigned=$ass, ent=$ent")
+          }
+        }*/
+        recoveryPaths[majorPath]?.forEach { rp ->
+          p.edges().forEach { (u, v) ->
+            val ent = u.links.count { it.contains(v) && it.entangled }
+            val ass = u.links.count { it.contains(v) && it.assigned }
+            // println("      edge $u-$v : assigned=$ass, ent=$ent")
           }
         }
       }
@@ -198,8 +200,6 @@ import kotlin.math.ceil
 
     //    类型：majorPaths: List<PickedPathNotClearSD>
   //    recoveryPaths: Map<PickedPathNotClearSD, List<RecoveryPath>>
-
-
     fun pickAndAssignPath(pick: PickedPathNotClearSD, majorPath: PickedPathNotClearSD? = null) {
       // if majorPath is null: *pick* is a major path
       // else: *pick* is a recovery path
@@ -500,9 +500,7 @@ import kotlin.math.ceil
         recoveryPaths.forEach { (_, w, p) ->
           p.edges().forEach { (u, v) ->
             val ent = u.links.count { it.contains(v) && it.entangled }
-//            println("    rp-edge $u-$v : entangled=$ent")
           }
-//          ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
           val available = p.edges().map { (n1, n2) -> n1.links.count { it.contains(n2) && it.entangled } }.min()!!
           pathToRecoveryPaths[pathWithWidth].add(RecoveryPath(p, w, 0, available))
         }
